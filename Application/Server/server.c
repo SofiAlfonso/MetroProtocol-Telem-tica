@@ -32,6 +32,9 @@ int num_users = 2;
 session_t sessions[100];
 int session_count = 0;
 user_t valid_users[] = {{"admin", "1234"},};
+metro_state_t metro;
+pthread_mutex_t metro_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t sessions_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* Manejo de Ctrl+C para cerrar el socket de escucha */
 void handle_sigint(int sign) {
@@ -73,10 +76,13 @@ int parse_message(const char *buf, size_t n, message_t *msg) {
         } else if (strncmp(line, "PAYLOAD_LENGTH:", 15) == 0) {
             msg->payload_len = atoi(line+16);
         } else if (strncmp(line, "PAYLOAD:", 8) == 0) {
-            // Payload comienza en la siguiente línea
             char *payload_start = strstr(buf, "PAYLOAD:\n");
             if (payload_start) {
                 payload_start += 9;
+                // Asegurarse de no leer fuera del buffer
+                if (msg->payload_len > n - (payload_start - buf)) {
+                    msg->payload_len = n - (payload_start - buf);
+                }
                 msg->payload = strndup(payload_start, msg->payload_len);
             }
             break;
@@ -88,13 +94,53 @@ int parse_message(const char *buf, size_t n, message_t *msg) {
     return 0;
 }
 
-/* Handler para el hilo del cliente*/
+void handle_command(char *cmd) {
+    size_t len = strlen(cmd);
+    while (len > 0 && (cmd[len-1] == '\n' || cmd[len-1] == '\r' || cmd[len-1] == ' ')) {
+        cmd[len-1] = '\0';
+        len--;
+    }
+
+    if (strcmp(cmd, "SPEED UP") == 0) {
+        // Aumentar velocidad sin interferir con STOPNOW/STARTNOW
+        if (!metro.command_active && metro.speed <= 90) {
+            metro.speed_override= metro.speed + 10;  // límite máximo 100
+            log_msg("Comando: SPEED UP -> velocidad=%d", metro.speed);
+        }
+
+    } else if (strcmp(cmd, "SLOW DOWN") == 0) {
+        // Disminuir velocidad sin interferir con STOPNOW/STARTNOW
+        if (!metro.command_active && metro.speed > 10) {
+            metro.speed_override = metro.speed - 10;// límite mínimo 1
+            log_msg("Comando: SLOW DOWN -> velocidad=%d", metro.speed);
+        }
+
+    } else if (strcmp(cmd, "STOPNOW") == 0) {
+        // Detener el metro hasta que se reciba STARTNOW
+        metro.speed = 0;      // velocidad forzada a 0
+        metro.command_active = 1;      // override activo
+        log_msg("Comando: STOPNOW -> metro detenido hasta STARTNOW");
+
+    } else if (strcmp(cmd, "STARTNOW") == 0) {
+        // Arrancar solo si estaba detenido por STOPNOW
+        if (metro.command_active && metro.speed_override == 0) {
+            metro.command_active = 1;
+            metro.speed = 40;  // velocidad base al arrancar
+            log_msg("Comando: STARTNOW -> metro arrancando, ciclo normal continuará");
+        }
+
+    } else {
+        log_msg("Comando desconocido: %s", cmd);
+    }
+}
+
+/* Handler para el hilo del cliente */
 void *client_handler(void *arg) {
     client_info_t *ci = (client_info_t *)arg;
-    int fd = ci->fd;
+    const int fd = ci->fd;
     char client_ip[INET_ADDRSTRLEN];
     strncpy(client_ip, ci->ip, sizeof(client_ip));
-    int client_port = ci->port;
+    const int client_port = ci->port;
     free(ci);
 
     log_msg("Cliente conectado: %s:%d (fd=%d)", client_ip, client_port, fd);
@@ -111,22 +157,17 @@ void *client_handler(void *arg) {
 
     while ((n = recv(fd, buf, sizeof(buf) - 1, 0)) > 0) {
         buf[n] = '\0';
-
-        /* Log del mensaje crudo */
         log_msg("Recibido de %s:%d ->\n%s", client_ip, client_port, buf);
 
-        /* Parsear usando parse_message() */
         message_t msg = {0};
         if (parse_message(buf, n, &msg) < 0) {
-            char *resp = "TYPE: ERROR\nTOKEN: NULL\nPAYLOAD_LENGTH: 20\nPAYLOAD:\nFormato inválido\n";
+            const char *resp = "TYPE: ERROR\nTOKEN: NULL\nPAYLOAD_LENGTH: 20\nPAYLOAD:\nFormato inválido\n";
             send(fd, resp, strlen(resp), 0);
             log_msg("Enviado ERROR a %s:%d (formato inválido)", client_ip, client_port);
             continue;
         }
 
-        /* Procesar por TYPE */
         if (strcmp(msg.type, "LOGIN") == 0) {
-            /* Ejemplo de payload: USER=admin;PASS=1234 */
             char user[32], pass[32];
             if (sscanf(msg.payload, "USER=%31[^;];PASS=%31s", user, pass) == 2) {
                 int ok = 0;
@@ -140,53 +181,63 @@ void *client_handler(void *arg) {
                 if (ok) {
                     char token[64];
                     generate_token(token, sizeof(token));
+
+                    pthread_mutex_lock(&clients_mutex);
                     strcpy(sessions[session_count].token, token);
                     strcpy(sessions[session_count].user, user);
                     session_count++;
+                    pthread_mutex_unlock(&clients_mutex);
 
                     char resp[256];
                     snprintf(resp, sizeof(resp),
-                        "TYPE: RESPONSE\nTOKEN: %s\nPAYLOAD_LENGTH: 2\nPAYLOAD:\nOK\n", token);
+                             "TYPE: RESPONSE\nTOKEN: %s\nPAYLOAD_LENGTH: 2\nPAYLOAD:\nOK\n", token);
                     send(fd, resp, strlen(resp), 0);
                     log_msg("Login correcto para %s, token=%s", user, token);
                 } else {
-                    char *resp = "TYPE: RESPONSE\nTOKEN: NULL\nPAYLOAD_LENGTH: 19\nPAYLOAD:\nERROR Credenciales\n";
+                    const char *resp = "TYPE: RESPONSE\nTOKEN: NULL\nPAYLOAD_LENGTH: 19\nPAYLOAD:\nERROR Credenciales\n";
                     send(fd, resp, strlen(resp), 0);
                     log_msg("Login fallido para user=%s", user);
                 }
             } else {
-                char *resp = "TYPE: ERROR\nTOKEN: NULL\nPAYLOAD_LENGTH: 18\nPAYLOAD:\nFormato LOGIN inválido\n";
-                send(fd, resp, strlen(resp), 0);
-            }
-
-        } else if (strcmp(msg.type, "TELEMETRY") == 0) {
-            if (msg.payload) {
-                log_msg("TELEMETRY de %s:%d -> %s", client_ip, client_port, msg.payload);
-                char *resp = "TYPE: RESPONSE\nTOKEN: NULL\nPAYLOAD_LENGTH: 2\nPAYLOAD:\nOK\n";
+                const char *resp = "TYPE: ERROR\nTOKEN: NULL\nPAYLOAD_LENGTH: 18\nPAYLOAD:\nFormato LOGIN inválido\n";
                 send(fd, resp, strlen(resp), 0);
             }
 
         } else if (strcmp(msg.type, "COMMAND") == 0) {
             if (validate_token(msg.token)) {
-                log_msg("COMMAND válido: %s", msg.payload);
-                char *resp = "TYPE: RESPONSE\nTOKEN: NULL\nPAYLOAD_LENGTH: 2\nPAYLOAD:\nOK\n";
+                log_msg("COMMAND recibido: %s", msg.payload);
+                pthread_mutex_lock(&metro_mutex);
+                handle_command(msg.payload);
+                pthread_mutex_unlock(&metro_mutex);
+
+                const char *resp = "TYPE: RESPONSE\nTOKEN: NULL\nPAYLOAD_LENGTH: 2\nPAYLOAD:\nOK\n";
                 send(fd, resp, strlen(resp), 0);
             } else {
-                char *resp = "TYPE: RESPONSE\nTOKEN: NULL\nPAYLOAD_LENGTH: 16\nPAYLOAD:\nERROR Token inválido\n";
+                const char *resp = "TYPE: RESPONSE\nTOKEN: NULL\nPAYLOAD_LENGTH: 16\nPAYLOAD:\nERROR Token inválido\n";
                 send(fd, resp, strlen(resp), 0);
             }
 
         } else if (strcmp(msg.type, "LOGOUT") == 0) {
-            char *resp = "TYPE: RESPONSE\nTOKEN: NULL\nPAYLOAD_LENGTH: 2\nPAYLOAD:\nOK\n";
+            const char *resp = "TYPE: RESPONSE\nTOKEN: NULL\nPAYLOAD_LENGTH: 2\nPAYLOAD:\nOK\n";
             send(fd, resp, strlen(resp), 0);
             log_msg("Cliente %s:%d cerró sesión", client_ip, client_port);
+
+            pthread_mutex_lock(&clients_mutex);
+            for (int i = 0; i < session_count; i++) {
+                if (strcmp(sessions[i].token, msg.token) == 0) {
+                    sessions[i] = sessions[--session_count];
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&clients_mutex);
+
             break;
 
         } else {
             char resp[256];
             snprintf(resp, sizeof(resp),
-                "TYPE: ERROR\nTOKEN: NULL\nPAYLOAD_LENGTH: 24\nPAYLOAD:\nTipo desconocido: %s\n",
-                msg.type);
+                     "TYPE: ERROR\nTOKEN: NULL\nPAYLOAD_LENGTH: 24\nPAYLOAD:\nTipo desconocido: %s\n",
+                     msg.type);
             send(fd, resp, strlen(resp), 0);
             log_msg("Tipo desconocido: %s", msg.type);
         }
@@ -194,13 +245,8 @@ void *client_handler(void *arg) {
         if (msg.payload) free(msg.payload);
     }
 
-    if (n == 0) {
-        log_msg("Cliente %s:%d desconectó (fd=%d)", client_ip, client_port, fd);
-    } else if (n < 0) {
-        log_msg("Error recv de %s:%d: %s", client_ip, client_port, strerror(errno));
-    }
+    log_msg("Cliente %s:%d desconectó (fd=%d)", client_ip, client_port, fd);
 
-    // Eliminar al cliente de la lista global
     pthread_mutex_lock(&clients_mutex);
     for (int i = 0; i < client_count; i++) {
         if (clients[i] == fd) {
@@ -215,44 +261,45 @@ void *client_handler(void *arg) {
 }
 
 void *telemetry_thread(void *arg) {
-    metro_state_t metro = {
-        .current_station = 1,      // empezar en estación 1
-        .total_stations = 5,
-        .direction = 1,            // 1 = adelante, -1 = reversa
-        .speed = 0,                // iniciar parado en estación 1
-        .battery = 100,
-        .stop_counter = 2           // parar 20s en la estación inicial
-    };
-
     while (running) {
         sleep(10); // ciclo de telemetría cada 10s
 
-        // ===== Lógica del Metro =====
-        if (metro.stop_counter > 0) {
-            metro.speed = 0;          // metro parado
-            metro.stop_counter--;     // disminuir contador de parada
+        pthread_mutex_lock(&metro_mutex);
+
+        // ===== Override STOPNOW/STARTNOW =====
+        if (metro.command_active) {
+            metro.speed = metro.speed_override;  // fuerza velocidad override
         } else {
-            metro.speed = 40;         // velocidad normal
-            metro.current_station += metro.direction;
+            // ===== Lógica normal del metro =====
+            if (metro.stop_counter > 0) {
+                metro.speed = 0;       // metro parado por parada normal
+                metro.stop_counter--;  // disminuir contador de parada
+            } else {
+                if (metro.speed_override == -1) {
+                    metro.current_station += metro.direction;
+                }else {
+                    metro.speed = metro.speed_override;
+                }
 
-            // Verificar estaciones terminales para invertir dirección
-            if (metro.current_station >= metro.total_stations) {
-                metro.current_station = metro.total_stations;
-                metro.direction = -1;
-            } else if (metro.current_station <= 1) {
-                metro.current_station = 1;
-                metro.direction = 1;
+                // Verificar estaciones terminales para invertir dirección
+                if (metro.current_station >= metro.total_stations) {
+                    metro.current_station = metro.total_stations;
+                    metro.direction = -1;
+                } else if (metro.current_station <= 1) {
+                    metro.current_station = 1;
+                    metro.direction = 1;
+                }
+
+                // Cada vez que llegamos a una estación, parar 20s
+                metro.stop_counter = 2;
             }
-
-            // Cada vez que llegamos a una estación, parar 20s
-            metro.stop_counter = 2;
         }
 
         // Simular ligera variación de batería
         metro.battery -= 1;
         if (metro.battery < 20) metro.battery = 90; // recarga simulada
 
-        // ===== Preparar payload =====
+        // Preparar payload
         char payload[256];
         snprintf(payload, sizeof(payload),
                  "STATION=%d\nSPEED=%d\nBATTERY=%d\nDIRECTION=%s\n",
@@ -261,22 +308,36 @@ void *telemetry_thread(void *arg) {
                  metro.battery,
                  metro.direction == 1 ? "FORWARD" : "REVERSE");
 
+        pthread_mutex_unlock(&metro_mutex);
+
+        // ===== Enviar a todos los clientes =====
         char message[512];
         snprintf(message, sizeof(message),
                  "TYPE: TELEMETRY\nTOKEN: NULL\nPAYLOAD_LENGTH: %zu\nPAYLOAD:\n%s",
                  strlen(payload), payload);
 
-        // ===== Enviar a todos los clientes =====
         pthread_mutex_lock(&clients_mutex);
         for (int i = 0; i < client_count; i++) {
             send(clients[i], message, strlen(message), 0);
         }
         pthread_mutex_unlock(&clients_mutex);
 
-        // ===== Logging completo usando log_msg =====
+        // Logging completo
         log_msg("BROADCAST TELEMETRY -> STATION=%d SPEED=%d BATTERY=%d DIRECTION=%s",
                 metro.current_station, metro.speed, metro.battery,
                 metro.direction == 1 ? "FORWARD" : "REVERSE");
+
+        // Reset de override si STARTNOW ya permitió retomar la velocidad normal
+        pthread_mutex_lock(&metro_mutex);
+        if (metro.speed_override != 0 && metro.command_active) {
+            metro.command_active = 0; // volver a ciclo normal
+            metro.stop_counter = 0;
+        }
+        if (metro.speed_override !=-1) {
+            metro.speed_override = -1;
+            metro.stop_counter = 0;
+        }
+        pthread_mutex_unlock(&metro_mutex);
     }
     return NULL;
 }
@@ -333,6 +394,16 @@ int main(int argc, char *argv[]) {
     }
 
     log_msg("Servidor escuchando en puerto %d. Logs -> %s", port, logfname);
+
+    /* Inicialización de metro */
+    metro.current_station = 1;
+    metro.total_stations = 5;
+    metro.direction = 1;
+    metro.speed = 0;
+    metro.battery = 100;
+    metro.stop_counter = 2;
+    metro.command_active = 0;
+    metro.speed_override =  -1;
 
     /* Crear hilo de telemetría */
     pthread_t telemetry_tid;

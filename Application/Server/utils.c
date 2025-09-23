@@ -9,6 +9,7 @@
 #include <sys/types.h>
 
 FILE *logfile = NULL;
+pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void log_msg(const char *fmt, ...) {
     va_list ap;
@@ -17,6 +18,8 @@ void log_msg(const char *fmt, ...) {
     struct tm tm = *localtime(&t);
     char timestr[64];
     strftime(timestr, sizeof(timestr), "%Y-%m-%d %H:%M:%S", &tm);
+
+    pthread_mutex_lock(&log_mutex);
 
     printf("[%s] ", timestr);
     vprintf(fmt, ap);
@@ -31,6 +34,7 @@ void log_msg(const char *fmt, ...) {
         fflush(logfile);
         va_end(ap2);
     }
+    pthread_mutex_unlock(&log_mutex);
 
     va_end(ap);
 }

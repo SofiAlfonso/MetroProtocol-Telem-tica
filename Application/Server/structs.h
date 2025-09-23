@@ -41,7 +41,9 @@ typedef struct {
     int direction; // 1 = adelante, -1 = reversa
     int speed;     // km/h
     int battery;   // %
-    int stop_counter; // contador de ciclos para pausa en estación
+    int stop_counter;// contador de ciclos para pausa en estación
+    int command_active;
+    int speed_override;
 } metro_state_t;
 
 #endif //METROPROTOCOL_STRUCTS_H
