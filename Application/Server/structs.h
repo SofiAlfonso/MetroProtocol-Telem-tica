@@ -44,6 +44,8 @@ typedef struct {
     int stop_counter;// contador de ciclos para pausa en estación
     int command_active;
     int speed_override;
+    int progress;
+    int charging;
 } metro_state_t;
 
 #endif //METROPROTOCOL_STRUCTS_H
